@@ -1,0 +1,718 @@
+Архитектурное описание проекта ККД и Data Lineage
+
+1. Контекст и назначение
+Проект dg_full — реализация платформы Data Governance (DG).
+Основная СУБД — Аналитическая Платформа (АП) (Greenplum), схема метаданных: dg_full.
+
+Платформа решает две связанные задачи:
+
+Модуль	Назначение
+ККД (Контроль качества данных)
+Автоматизированные технические и бизнес-проверки данных на слоях STG → ODS → DV → DM, фиксация ошибок, алерты, мониторинг
+Data Lineage (DL)
+Построение сквозной цепочки зависимостей объектов от источников до дашбордов Qlik Sense, оркестрация потоков, контроль актуальности
+Оба модуля опираются на единое хранилище метаданных в виде графа (модель, близкая к GraphDB/DAG).
+
+2. Общая архитектура (слои)
+Источники метаданных и данных
+Слой метаданных meta_*
+Движок Greenplum PL/pgSQL
+Визуализация и потребители
+meta_error_event_fact
+Greenplum GP/АП
+CTL оркестратор
+Qlik Sense ETL Apps
+AirFlow планируется
+meta_node_ref_table
+meta_edge_link
+meta_scheduler_*
+meta_screen_* / meta_signal_*
+fill_meta_*
+return_meta_run_batch_*
+return_meta_search_graph
+return_meta_run_signal
+BI: Data Quality
+BI: DE control / Lineage
+BI: DG Main Page
+DQ Alerts Python
+PROM мониторинг
+Принцип: метаданные и результаты проверок хранятся в АП; бизнес-логика — в функциях PL/pgSQL; UI — в BI (дашборды поверх представлений bi_*, vmeta_*).
+
+3. Модель данных (граф метаданных)
+3.1. Вершины графа (meta_node_ref_table)
+Объекты данных и процессы:
+
+Тип	Роль
+Table, Entity
+Хранилища результатов преобразований
+View, Function
+Объекты-преобразователи
+CTL (Flow)
+ETL-потоки оркестратора
+QVD
+Файлы данных BI
+Dash Board BI, ETL Application BI
+Потребители и загрузчики BI
+Справочник типов: meta_node_type_ref_table.
+
+3.2. Рёбра графа (meta_edge_link)
+Связи между объектами с типом (meta_edge_type_ref_table), ролью Вход/Выход, весом и признаком enable_dq. Прямая связь Table → Table запрещена: преобразование всегда проходит через View / Function / CTL / BI Application.
+
+Типовые цепочки lineage:
+
+ODS → DM (витрины) → BI
+ODS → DV → DM → QVD / BI
+ODS → CTL → DM
+Table/View/QVD → ETL Application BI → QVD → Dashboard BI
+3.3. Оркестрация потоков
+Сущность	Назначение
+meta_scheduler_hsat
+Расписание, SLA (ods_ready, dm_ready), ответственные
+meta_scheduler_plan
+Плановые vs фактические запуски, отклонения
+meta_event_hsat, meta_event_statistic_hsat
+Фактическое исполнение потоков (STATE, Row Count, Time Length, Row Reject)
+meta_search_graph_target_all_obj
+Предрасчёт иерархий для быстрого поиска lineage
+3.4. Представления для UI
+return_meta_search_graph() — рекурсивный обход графа, генерация GraphViz для визуализации lineage
+meta_search_graph_flow — связь потоков с объектами в цепочке
+vmeta_data_catalog, vmeta_ctl_hierarchy — Data Catalog и иерархия CTL
+vctl_* — интеграция с метаданными CTL (wf, loading, status)
+4. Архитектура ККД (Контроль качества данных)
+4.1. Концепция
+ККД выполняется внутри АП в момент или после передачи данных между слоями:
+
+Подготовка метаданных (бизнес-ключи, группы объектов)
+Настройка шаблонов проверок
+Запуск в составе ETL-потока или отдельным потоком
+Сохранение неконсистентных записей и уведомление ответственных
+4.2. Метамодель проверок
+meta_object_group_ref_table   — группа объектов, проверяемых одним запросом
+        ↓
+meta_object_ref_table         — конкретные таблицы/поля группы
+        ↓
+meta_screen_template_ref_table — SQL-шаблон проверки (с алиасами {{..}} или прямой SQL)
+meta_screen_template_alias_ref_table — подстановка алиасов
+        ↓
+meta_screen_link              — привязка проверки к группе, etl_stage, period_run, severity
+        ↓
+meta_error_event_fact         — результаты выполнения
+meta_batch_fact               — пакет запуска
+Типы проверок (по документации):
+
+сверка количества записей источник ↔ приёмник
+уникальность по бизнес-ключам
+заполненность критичных полей
+корректность формата (даты и т.п.)
+бизнес-проверки (meta_add_business_kkd, категории Incorrect / Ambiguous / Inconsistent / Incomplete)
+4.3. Движок выполнения
+Ключевая функция — return_meta_run_batch_v2/v3:
+
+Принимает etl_stage, схему/таблицу, wf_load_id, wf_id, period_run
+Формирует batch_id, подставляет шаблоны SQL, создаёт temp-таблицы
+Использует статистику vmeta_error_event_stat для динамических порогов (avg ± stddev)
+Пишет результаты в meta_error_event_fact
+Поддерживает режим тестирования шаблонов (v_test_templ)
+Запуск может быть:
+
+совместно с загрузкой (по wf_load_id конкретной таблицы)
+отдельным потоком (глобальная проверка по всему объёму таблицы)
+4.4. Сигналы и алерты
+meta_signal_link → return_meta_run_signal → meta_run_signal
+        ↓
+meta_email_template_ref_table + meta_email_recipient_ref_table
+        ↓
+DQ Alerts (Python-сервис, в разработке Q2)
+        ↓
+PROM / email
+Сигналы формируются для бизнес-показателей и технических проверок; поддерживаются HTML-вложения и вложения с детализацией по screen_id.
+
+4.5. Исключения
+meta_exception_group_ref_table, meta_exception_action_ref_table — управление исключениями из проверок
+Загрузка исключений в BI для операционного мониторинга
+5. Архитектура Data Lineage
+5.1. Назначение
+Модуль формирует сквозную цепочку зависимостей от источников (АС, Excel, АП) до приложений BI и решает задачи:
+
+impact analysis («что затронет изменение объекта»)
+root cause analysis («откуда пришли данные»)
+мониторинг актуальности и duration загрузок
+сравнение плановых и фактических зависимостей
+5.2. Загрузка метаданных lineage
+Источник → Процесс → Приёмник	Способ
+Table → View
+Автоматически из метаданных GP
+Table/View → Function → Table
+Автоматически из GP
+Table/View → CTL → Table
+Ручной / частично автоматизированный; целевой — API CTL
+CTL → CTL
+Оркестрация потоков; «самоинициализация» потоков
+Table/View → BI ETL App → QVD → Dashboard
+Ручной
+Источник → BI
+Нецелевые интеграции (тех. долг)
+Текущее состояние: заполнение структур — преимущественно скриптами; целевое — автоматический сбор через API GP, CTL, AirFlow, BI.
+
+«Самоинициализация» потоков: в каждый CTL-поток встраиваются функции init (метаданные потока) и fix (статистика запуска).
+
+5.3. Аналитика потоков
+Сравнение плановых связей vs фактического исполнения
+Контроль SLA по витринам (meta_scheduler_plan, vmeta_check_kkd_duration)
+Аналитика объёма загрузок, отклонения от нормы
+Мониторинг актуальности данных АП (отдельные дашборды DL)
+5.4. UI: DE control
+Инструмент Data Lineage (DE control) в Qlik Sense:
+
+построение lineage по объектам (GraphViz через return_meta_search_graph)
+мониторинг работы и обновления объектов
+6. Слой представления (BI)
+Инструмент	Назначение	Статус
+DG Main Page
+Сводка качества для руководителей
+Тестирование в PROM
+Data Quality (тех. проверки)
+Мониторинг DQ-ошибок и статусов
+На поддержке
+Data Lineage (DE control)
+Lineage, duration, актуальность
+На поддержке
+Паспорт объекта
+Детали по объекту: статус, тех. и бизнес-проверки
+Запланирован
+Контроль квоты АП
+Мониторинг объёма
+На поддержке
+DQ Alerts
+Python-сервис рассылки
+В разработке
+Представления для BI: префиксы bi_* (ошибки DQ), vmeta_* (каталог, статистика, алерты, duration).
+
+7. Структура артефактов проекта
+dg_full/
+├── docum/                    # Документация Confluence (HTML)
+│   ├── 5.1.6.2_*             # Data Lineage
+│   ├── 5.1.6.5_*             # Data Quality / ККД
+│   ├── Architecture.html
+│   ├── Распределенная_архитектура_платформы_DQ.html
+│   └── ROADMAP_ККД_и_DL.html
+├── ddl_tables_20260601.sql   # ~45 таблиц meta_*
+├── ddl_views_20260601.sql    # ~80+ представлений vmeta_*, bi_*, vctl_*
+├── ddl_func_20260601.sql     # ~50+ функций fill_*, return_*
+└── dml/                      # Справочные и конфигурационные данные
+    ├── meta_screen_link_*.sql
+    ├── meta_screen_template_ref_table_*.sql
+    ├── meta_node_ref_table_*.sql
+    ├── meta_edge_link_*.sql
+    └── ...
+8. Интеграции
+wf, loading, stats
+tables, views, functions
+QVD, apps
+return_meta_run_batch
+результаты
+return_meta_search_graph
+CTL
+meta_*
+GreenPlum catalog
+BI
+ETL потоки
+meta_error_event_fact
+BI Dashboards
+DQ Alerts
+PROM
+CTL: views vctl_*, иерархия vmeta_ctl_hierarchy, статистика STATE
+Greenplum: парсинг зависимостей view/function, системные представления
+Qlik Sense: QVD lineage, ETL-приложения, дашборды потребления
+PROM: вывод функционала сверок (roadmap)
+AirFlow: планируется как замена/дополнение CTL для структур потоков
+9. Эволюция архитектуры (roadmap)
+Документ «Распределённая архитектура платформы DQ» описывает варианты развития:
+
+Вариант	Суть
+1. Распределённый ККД
+ККД + UI ; проверки близко к месту расчёта
+2. Централизованный на AI Gateway
+DG как автономный модуль, единый источник для UI
+3. ККД на стороне АП
+Текущая реализация
+4. Распределённый ККД + общий UI
+
+
+10. Ключевые архитектурные решения
+Graph-in-RDBMS — lineage и оркестрация хранятся реляционно (node + edge), обход — рекурсивный SQL; визуализация — GraphViz.
+Metadata-driven DQ — проверки декларативны: шаблон SQL + группа объектов + расписание; без изменения кода движка.
+Единая схема meta_* — ККД и DL разделяют модель объектов; enable_dq на рёбрах связывает lineage с проверками.
+Push-down execution — проверки выполняются в Greenplum рядом с данными, а не во внешнем сервисе.
+BI как UI-слой — без отдельного web-приложения; кастомный graph-UI рассматривался как альтернатива.
+Версионность и SCD — eff_from_dttm / eff_to_dttm / last_seen_dttm на узлах и рёбрах.
+11. Ограничения и технический долг
+Ручное поддержание связей Table/View → CTL и BI lineage
+Неполная автоматизация сбора метаданных (целевой API-подход не завершён)
+Дублирование структур при распределённой архитектуре (риск рассинхронизации)
+Нецелевые интеграции (источник → QVD/BI напрямую) отображаются в графе, но помечены как тех. долг
+AirFlow как оркестратор — в перспективе, не в текущей реализации
+Целевое выделение мета-БД в PostgreSQL — рассматривалось, сейчас всё в схеме АП
+Это описание основано на DDL/DML артефактах (ddl_*_20260601.sql, dml/) и документации в docum/. Если нужно, могу детализировать отдельно модель проверок ККД, процесс загрузки lineage или карту функций return_meta_* / fill_meta_*.
+
+------------------------------------------------------
+Детализация модели проверок ККД
+Модель ККД построена по принципу metadata-driven DQ: проверки описываются декларативно в таблицах метаданных, а исполнение выполняет единый движок return_meta_run_batch_v2/v3 в Greenplum. Ниже — полная структура модели от конфигурации до результата.
+
+1. Общая схема модели
+meta_screen_template_ref_table
+(no attributes)
+meta_screen_template_alias_ref_table
+(no attributes)
+meta_screen_link
+(no attributes)
+meta_object_group_ref_table
+(no attributes)
+meta_object_ref_table
+(no attributes)
+meta_error_event_fact
+(no attributes)
+meta_batch_fact
+(no attributes)
+meta_exception_group_ref_table
+(no attributes)
+meta_exception_action_ref_table
+(no attributes)
+meta_signal_link
+(no attributes)
+алиасы
+шаблон
+объекты
+группа
+результат
+пакет
+пороги
+сигналы
+Логика связей:
+
+Шаблон SQL (template)  +  Алиасы (alias)
+         ↓
+Экземпляр проверки (screen_link)  ←→  Группа объектов (object_group)
+         ↓                                      ↓
+                              Объекты/поля (object_ref)
+         ↓
+Пакет запуска (batch) → Факты ошибок (error_event_fact) → Алерты (signal)
+2. Слои метамодели
+2.1. Шаблон проверки — meta_screen_template_ref_table
+Библиотека переиспользуемых SQL-шаблонов.
+
+Поле	Назначение
+screen_template_id
+ID шаблона (PK)
+screen_sql
+SQL проверки
+screen_type
+Тип данных: Numeric, Text, All и т.д.
+screen_category
+Категория/название проверки
+is_direct_sql
+0 — подстановка алиасов {{..}}; 1 — готовый SQL без подстановки
+priority_cd
+Приоритет: Low / Medium / High / Critical
+descr
+Бизнес-описание
+Контракт SQL-шаблона — результат должен возвращать ровно два столбца:
+
+SELECT
+    JSON_BUILD_OBJECT('unit', 'cnt', 'attr', '{{field_name}}', ...) AS record_identifier,
+    <число или текст> AS v_value
+record_identifier — JSON-идентификатор строки результата (агрегат, атрибут, детальная запись)
+v_value — метрика нарушения (количество, процент, флаг и т.д.)
+Примеры типовых шаблонов из DML:
+
+ID	Категория	Суть
+1, 10001
+% null
+Процент NULL по полю
+73
+Количество загруженных строк
+Row count с фильтром по wf_load_id
+87
+Количество дублей по ключевым атрибутам
+% дублей по группе полей
+10078
+Последняя расчётная дата
+Отставание max(date) от текущей даты
+20–26
+Business check
+Бизнес-правила (SQL = NULL, is_direct_sql=1)
+10075+
+Специфичные MART/ОПУ
+Кастомные проверки со сложной логикой
+2.2. Алиасы шаблона — meta_screen_template_alias_ref_table
+Связывает placeholders в SQL с объектами группы.
+
+Поле	Пример
+object_alias
+{{table_name}}, {{field_name}}, {{field_name1}}, {{p_wf_load_id}}
+attribute_src_id
+Конкретное значение: s_...schema.table, column_name, $1
+object_order
+Порядок подстановки (важен при зависимых заменах)
+Типы подстановки (из движка):
+
+Обычный объект (node_type_src_id ≠ 12) → прямая замена алиаса на schema.table или имя поля
+Параметр (node_type_src_id = 12) → замена на $1, $2… с передачей через EXECUTE ... USING
+2.3. Группа объектов — meta_object_group_ref_table
+Поле	Назначение
+object_group_id
+ID группы
+object_group_name
+Имя (для business check = категория)
+object_group_type
+1 — проверка атрибута таблицы; 2 — проверка всей таблицы
+is_active
+Активность группы
+Группа объединяет объекты, которые проверяются одним SQL-запросом (например, source + target для сверки, или несколько полей в одной проверке дублей).
+
+2.4. Объекты проверки — meta_object_ref_table
+Поле	Назначение
+object_id
+ID объекта
+schema_src_id, table_src_id
+Схема и таблица
+attribute_src_id
+Поле или выражение
+object_alias
+Алиас в шаблоне
+object_order
+Порядок в группе
+object_group_id
+FK на группу
+node_type_src_id
+Тип: таблица, поле, параметр
+attribute_type
+Тип атрибута для спец. проверок
+is_active
+Признак активности
+2.5. Экземпляр проверки — meta_screen_link
+Связывает шаблон + группу + режим запуска. Это конкретная проверка на конкретном объекте.
+
+Поле	Назначение
+screen_id
+Уникальный ID проверки (PK)
+screen_template_id
+FK на шаблон
+object_group_id
+FK на группу объектов
+etl_stage
+Слой: stg, ods, dm, view
+period_run
+Режим запуска (см. ниже)
+processing_order
+0 — только свод (STG/ODS); 1 — свод + детализация (DM)
+default_severity_score
+Базовый вес ошибки
+exception_group_id
+FK на группу порогов
+eff_from_dt / eff_to_dt
+Период действия
+is_active
+Активность
+Пример из DML:
+
+screen_id=163296, template=1, group=163295, etl_stage='ods', period_run='ctl'
+-- проверка % NULL на ODS, запуск в составе CTL-потока
+3. Режимы запуска
+3.1. По ETL-слою (etl_stage)
+Слой	Когда запускается	Типичные проверки
+stg
+После загрузки в STG
+Формат, базовая полнота
+ods
+После загрузки в ODS
+Дубли, row count, ключи, ctl_id
+dm
+После витрин
+Бизнес-правила, сверки
+view
+По представлениям
+Проверки на уровне view
+3.2. По периодичности (period_run)
+Значение	Смысл
+ctl
+Запуск в составе ETL-потока CTL (по wf_load_id загрузки)
+view
+Запуск по view / отдельному расписанию
+daily, weekly, monthly
+Периодические проверки
+on-demand
+Ручной запуск
+3.3. По контексту wf_load_id
+Движок return_meta_run_batch_v2 принимает:
+
+Параметр	Назначение
+p_wf_load_id
+ID текущей загрузки
+p_wf_id
+ID загрузчика (CTL workflow)
+p_tbl_rstri_wf_load_id
+Фильтр объёма данных
+Режимы фильтрации в шаблонах ({{p_wf_load_id}}):
+
+Значение	Поведение
+Конкретный wf_load_id
+Проверка только текущей загрузки
+-1
+Вся таблица (без фильтра)
+-2
+Последний max(wf_load_id) в таблице
+Два сценария вызова:
+
+Inline с загрузкой — p_tbl_rstri_wf_load_id = p_wf_load_id (проверяем только что загруженные данные)
+Отдельный DQ-поток — p_tbl_rstri_wf_load_id = -1/-2 (глобальная проверка по таблице)
+4. Движок исполнения
+4.1. Точка входа
+return_meta_run_batch_v2(
+    p_etl_stage,      -- 'ods', 'stg', 'dm'
+    p_sch_src_id,     -- схема (или '' для всех)
+    p_tbl_src_id,     -- таблица (или '' для всех)
+    p_attr_src_id,    -- атрибут (опционально)
+    p_wf_load_id,
+    p_wf_id,
+    p_period_run,     -- 'ctl', 'view', ...
+    p_tbl_rstri_wf_load_id
+) → batch_id
+4.2. Алгоритм выполнения
+return_meta_run_batch_v2
+Создать batch_id
+Загрузить статистику порогов temp_meta_error_event_stat
+Выбрать object_ref для schema/table
+Выбрать screen_link по etl_stage + period_run
+Для каждой проверки
+Подставить алиасы в screen_sql
+CREATE TEMP TABLE temp_out_tbl AS ...sql
+Рассчитать severity по порогам
+INSERT meta_error_event_fact
+Обновить meta_batch_fact.stts
+Ключевые шаги:
+
+Отбор проверок — join vmeta_screen_link + vmeta_object_group_ref_table + meta_screen_template_ref_table, фильтр по etl_stage, period_run, is_active, object_group_type IN (1,2)
+
+Подстановка алиасов — цикл по object_ref группы с ORDER BY object_order DESC (зависимые замены)
+
+Валидация — если в SQL остались {{...}}, проверка пропускается
+
+Исполнение — CREATE TEMPORARY TABLE temp_out_tbl AS <sql>
+
+Расчёт severity — сравнение v_value с динамическими порогами из vmeta_error_event_stat (avg ± stddev)
+
+Запись результата — insert в meta_error_event_fact
+
+Режим тестирования: при p_wf_id < -1 выполняется EXPLAIN ANALYZE без записи (batch_id = -999).
+
+5. Слой результатов
+5.1. Пакет — meta_batch_fact
+Поле	Назначение
+batch_id
+ID пакета (sequence synth_key_seq)
+start_dt / end_dt
+Время выполнения
+stts
+Общий статус: OK, ERROR
+wf_load_id
+Контекст загрузки
+batch_params
+Параметры вызова
+5.2. Факт ошибки — meta_error_event_fact
+Поле	Назначение
+batch_id
+FK на пакет
+screen_id
+Какая проверка
+schema_src_id, table_src_id
+Объект
+record_identifier
+JSON-идентификатор (unit, attr, детали)
+record_error
+Числовое значение нарушения
+final_severity_score
+Итоговый вес (0 = в норме, >0 = ошибка)
+value
+Текстовое описание: «Выше верхнего порога», «В диапазоне»
+metric, key_metric
+Категория проверки
+check_sql
+Фактически выполненный SQL
+exception_action_id
+Действие при ошибке
+wf_load_id, wf_id
+Контекст ETL
+Логика severity:
+
+IF record_identifier содержит 'unit'
+   AND v_value вне [min_inter, max_inter] из статистики
+THEN final_severity_score = default_severity_score
+ELSE final_severity_score = 0
+Пороги берутся из meta_error_event_stat / vmeta_error_event_stat:
+
+avg_moving_rec_error ± stddev_rec_error по (screen_id, unit)
+5.3. Статистика — meta_error_event_stat
+Накопленная история для адаптивных порогов:
+
+avg_rec_error, stddev_rec_error, avg_moving_rec_error
+unit — тип метрики (cnt, %, и т.д.)
+Используется для детекции аномалий («объём загрузки сильно отличается от нормы»)
+6. Обработка исключений и порогов
+6.1. meta_exception_group_ref_table
+Группа интервалов для определения реакции на ошибку.
+
+6.2. meta_exception_action_ref_table
+ID	Действие
+1
+Pass — пропустить без ошибки
+2
+Pass with flag — пропустить, пометить
+3
+Reject — отклонить запись
+4
+Stop ETL — остановить поток
+Поля prc_from / prc_to — диапазон процента нарушения, при котором применяется действие.
+
+Связь: screen_link.exception_group_id → exception_action_ref_table по диапазону v_value.
+
+7. Сигналы и алерты
+7.1. meta_signal_link
+Параллельная модель для бизнес-сигналов (не технических проверок):
+
+Поле	Назначение
+signal_id
+ID сигнала
+screen_template_id
+SQL для формирования сигнала
+signal_value_cd
+Значение сигнала → выбор текста письма
+email_template_id, email_recipient_id
+Рассылка
+attached_screen_id, html_screen_id
+Вложения и HTML в письме
+Исполнение: return_meta_run_signal → meta_run_signal.
+
+8. Таксономия типов проверок
+8.1. Технические (шаблонные)
+Категория	Шаблоны	Слой
+Полнота
+% NULL (1, 10001)
+STG, ODS, DM
+Объём
+Row count (73)
+ODS
+Уникальность
+Дубли по ключам (87)
+ODS
+Актуальность
+Max date lag (10078)
+ODS, DM
+Формат
+Специфичные шаблоны
+STG
+8.2. Бизнес-проверки
+Два механизма:
+
+A. Шаблоны с is_direct_sql = 1 (screen_template_id 20–26, 10073 и др.)
+
+SQL хранится полностью в шаблоне или генерируется отдельно
+screen_category LIKE 'Business check%'
+B. Таблица meta_add_business_kkd
+
+Загрузка через SPOD/CSV
+Функция fill_meta_dq_business_table создаёт object_group + screen_link + object_ref
+-- meta_add_business_kkd
+schema_src_id, table_src_id, check_sql, screen_category
+8.3. Сверки (reconciliation)
+Проверки между слоями/системами — через группы объектов с несколькими object_ref (source + target) и шаблонами сравнения count/keys.
+
+8.4. Категории качества (IAIQ framework)
+Из комментариев к screen_category:
+
+Incorrect — неверные значения
+Ambiguous — неоднозначность
+Inconsistent — несогласованность между объектами
+Incomplete — неполнота
+9. Жизненный цикл: как заводится проверка
+9.1. Новый объект (через FSD)
+Excel-шаблон тех. проверок
+    → загрузка в SPOD (META_ADD_TECHNICAL_KKD)
+    → Python: Excel → JSON
+    → fill_meta_parse_json / DML-генератор
+    → INSERT в meta_* таблицы
+    → включение в релиз
+9.2. Существующий объект (через view)
+SELECT * FROM vmeta_s2t_dq_csv
+WHERE schema_src_id = '...' AND table_src_id IN (...)
+    → экспорт CSV
+    → отметка нужных проверок ('x' или номер группы)
+    → загрузка обратно через DA-процесс
+9.3. Ручные таблицы
+Для ручного сопровождения существуют _manual версии:
+
+meta_screen_link_manual
+meta_object_ref_table_manual
+meta_object_group_ref_table_manual
+Объединяются через vmeta_all_screen_link.
+
+10. Представления для мониторинга
+View	Назначение
+vmeta_all_screen_link
+Полный каталог проверок с подставленными алиасами
+vmeta_check_screen_link
+Контроль корректности конфигурации
+vmeta_dq_statistic
+Агрегированная статистика DQ
+vmeta_dq_alerts
+Данные для сервиса алертов
+vmeta_execute_fact
+Факт выполнения проверок
+bi_meta_error_event_fact
+Срез для Qlik Sense (только stts='OK', с unit)
+vmeta_s2t_dq_csv
+Экспорт/импорт конфигурации проверок
+11. Пример: проверка дублей на ODS
+Конфигурация:
+
+screen_template_id = 87  ("Количество dублей по ключевым атрибутам")
+object_group_id    = 86977  (группа: schema.table + key fields)
+screen_id          = 86978
+etl_stage          = 'ods'
+period_run         = 'ctl'
+exception_group_id = 1
+Подстановка алиасов:
+
+{{table_name}}  → s_grnplm_as_cib_gm_ods_xxx.my_table
+{{field_name}}  → business_key_col
+{{field_name1}} → wf_load_id
+{{p_wf_load_id}}→ $1 (параметр = текущий wf_load_id)
+Результат в meta_error_event_fact:
+
+record_identifier: {"unit": "%", "attr": "business_key_col"}
+record_error: 15.5        -- 15.5% дублей
+final_severity_score: 1.0 -- если выше порога
+value: "Выше верхнего порога: 10.0"
+12. Связь с Data Lineage
+На рёбрах meta_edge_link есть поле enable_dq — флаг, что для данной связи source→target должны выполняться проверки. Это позволяет:
+
+автоматически определять, какие проверки актуальны для объекта в цепочке lineage
+строить impact analysis: «какие DQ-проверки затронет изменение upstream-таблицы»
+13. Схемы хранения
+Схема	Роль
+s_grnplm_ld_cib_gm_dsc_dcp_dv
+Runtime: факты, функции, views (DDL)
+s_grnplm_as_cib_gm_dg
+Конфигурация: DML загрузки метаданных проверок
+14. Резюме архитектурных принципов модели
+Template → Instance — один шаблон порождает множество экземпляров через screen_link + object_group
+Group = один SQL — все объекты группы участвуют в одном запросе
+Contract-driven SQL — шаблон обязан вернуть (record_identifier JSON, v_value)
+Adaptive thresholds — severity определяется исторической статистикой, не только статическим порогом
+ETL-native execution — проверки встроены в CTL-потоки через period_run='ctl'
+Layer-aware — разные наборы проверок на STG / ODS / DM
+Declarative onboarding — Excel/CSV → JSON → DML, без изменения движка
+Если нужно, могу дальше разобрать конкретный сценарий: только STG→ODS, только бизнес-проверки, или формат JSON для генерации DML.
+
+представь суммаризованное описание проекта для публикации в github
